@@ -236,7 +236,7 @@ if(typeof module!=='undefined')module.exports={midiName:midiName,midiFreq:midiFr
 (function(){
 'use strict';
 var STORE='notepracticer.v1';
-var DEFAULTS={saMidi:60,tuning:'just',tol:25,feedback:'predict',noteDur:1.0,droneVol:0.5,hear:'voice'};
+var DEFAULTS={saMidi:60,tuning:'just',tol:25,feedback:'predict',noteDur:1.0,droneVol:0.5,hear:'voice',agc:true};
 var S={tab:'ear',settings:Object.assign({},DEFAULTS),entries:[],
   earLevel:0,earSt:{ok:0,bad:0},ear:{trial:null,answered:false,msg:''},
   sing:{sym:'S',oct:0,phase:'idle',frames:[],result:null,guess:null,msg:''},
@@ -542,37 +542,121 @@ async function startMic(){
   if(micStream)return;
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)
     throw new Error('This browser can’t use the microphone here. Open the page over https (e.g. GitHub Pages) in Chrome or Safari.');
-  micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:!!S.settings.agc}});
   micSrc=ac.createMediaStreamSource(micStream);
   analyser=ac.createAnalyser();analyser.fftSize=4096;analyser.smoothingTimeConstant=0;
   micSrc.connect(analyser);
 }
 function stopMic(){
-  stopListening();
+  stopListening();stopRec();
   if(micStream){micStream.getTracks().forEach(function(t){t.stop();});micStream=null;}
   try{if(micSrc)micSrc.disconnect();}catch(e){}
   micSrc=null;analyser=null;
 }
+var MIC={ring:[],gate:0.004};
 function startListening(cb){
   stopListening();
-  pbuf=new Float32Array(analyser.fftSize);
+  pbuf=new Float32Array(analyser.fftSize);MIC.ring=[];MIC.gate=0.004;
   listenTimer=setInterval(function(){
     if(!analyser)return;
     analyser.getFloatTimeDomainData(pbuf);
     var s=0,i;for(i=0;i<pbuf.length;i++)s+=pbuf[i]*pbuf[i];
     var rms=Math.sqrt(s/pbuf.length),r=null;
-    if(rms>=0.008)r=yin(pbuf,ac.sampleRate,{});
-    cb(r?{freq:r.freq,clarity:r.clarity,rms:rms}:{freq:null,clarity:0,rms:rms});
+    /* adaptive gate: 2.5x the quietest recent level, but never stricter than 0.01 or looser than 0.0015 */
+    MIC.ring.push(rms);if(MIC.ring.length>60)MIC.ring.shift();
+    MIC.gate=Math.min(0.01,Math.max(0.0015,quantile(MIC.ring,0.1)*2.5));
+    if(rms>=0.0012)r=yin(pbuf,ac.sampleRate,{thresh:0.2});
+    cb(r?{freq:r.freq,clarity:r.clarity,rms:rms,gate:MIC.gate}:{freq:null,clarity:0,rms:rms,gate:MIC.gate});
   },50);
 }
 function stopListening(){clearInterval(listenTimer);listenTimer=null;}
+/* ---------- recording + replay of what you sang ---------- */
+var REC={chunks:[],len:0,node:null,mute:null,buf:null,owner:null,src:null,playing:false};
+function startRec(owner){
+  stopReplay();stopRec();
+  REC.chunks=[];REC.len=0;REC.buf=null;REC.owner=owner;
+  if(!micSrc||!ac||!ac.createScriptProcessor)return;
+  try{
+    REC.node=ac.createScriptProcessor(4096,1,1);
+    REC.node.onaudioprocess=function(e){
+      if(REC.len>ac.sampleRate*180)return;
+      var d=e.inputBuffer.getChannelData(0);REC.chunks.push(new Float32Array(d));REC.len+=d.length;};
+    REC.mute=ac.createGain();REC.mute.gain.value=0;
+    micSrc.connect(REC.node);REC.node.connect(REC.mute);REC.mute.connect(ac.destination);
+  }catch(e){REC.node=null;}
+}
+function stopRec(){
+  if(!REC.node)return;
+  try{micSrc&&micSrc.disconnect(REC.node);}catch(e){}
+  try{REC.node.disconnect();REC.mute.disconnect();}catch(e){}
+  REC.node.onaudioprocess=null;REC.node=null;REC.mute=null;
+  if(REC.len>ac.sampleRate*0.3){
+    var b=ac.createBuffer(1,REC.len,ac.sampleRate),d=b.getChannelData(0),o=0,pk=0,i,c;
+    for(c=0;c<REC.chunks.length;c++){d.set(REC.chunks[c],o);o+=REC.chunks[c].length;}
+    for(i=0;i<d.length;i++){var a=d[i]<0?-d[i]:d[i];if(a>pk)pk=a;}
+    var g=pk>0?Math.min(20,0.7/pk):1;      /* bring quiet mics up to a comfortable level */
+    for(i=0;i<d.length;i++)d[i]*=g;
+    REC.buf=b;
+  }
+  REC.chunks=[];
+}
+function stopReplay(){
+  if(REC.src){try{REC.src.onended=null;REC.src.stop();}catch(e){}try{REC.src.disconnect();}catch(e){}REC.src=null;}
+  REC.playing=false;setRB();
+}
+function setRB(){if(REC.btn)REC.btn.textContent=REC.playing?'Stop':'Hear what you sang';}
+function playReplay(btn){
+  if(!REC.buf)return;
+  ensureAudio();
+  if(ac.state==='suspended')ac.resume();
+  REC.btn=btn;
+  if(REC.playing){stopReplay();setRB();return;}
+  stopLesson();
+  var src=ac.createBufferSource();src.buffer=REC.buf;src.connect(master);
+  REC.src=src;REC.playing=true;setRB();
+  src.onended=function(){REC.src=null;REC.playing=false;setRB();};
+  src.start();
+}
+function ReplayRow(owner){
+  if(!REC.buf||REC.owner!==owner)return null;
+  var btn=h('button',{class:'btn',type:'button'},REC.playing?'Stop':'Hear what you sang');REC.btn=btn;
+  btn.onclick=function(){playReplay(btn);};
+  return h('div',null,h('div',{class:'row',style:'margin-top:10px'},btn),
+    h('p',{class:'muted',style:'margin:6px 0 0'},'Plays your last attempt ('+REC.buf.duration.toFixed(1)+' s), made louder if your mic was quiet. Turn the drone off or use headphones to hear your voice clearly. It stays on this device and is not saved after you close the page.'));
+}
+function micHint(maxRms){
+  var db=Math.round(20*Math.log10(Math.max(maxRms||0,1e-5)));
+  if(!maxRms||maxRms<0.002)return 'I can barely hear anything (the mic only reached about '+db+' dB). Check that the right microphone is selected and its input volume is turned up in your computer’s sound settings, then try again. The Settings tab has a microphone test.';
+  return 'I heard sound (mic level about '+db+' dB) but couldn’t lock onto a clear pitch. Sing a steady “aa”, a little louder and closer to the mic, with the drone off or headphones on.';
+}
+async function micTest(out,lvl){
+  stopLesson();
+  out.className='';out.textContent='Starting the microphone… allow it if your browser asks.';
+  try{await startMic();}catch(e){out.className='warn';out.textContent=micError(e);return;}
+  var tr=micStream&&micStream.getAudioTracks()[0],label=tr&&tr.label?tr.label:'default microphone';
+  out.textContent='Listening on: '+label+'. Sing now…';
+  var t0=performance.now(),maxR=0,nV=0,last=null;
+  startListening(function(p){
+    maxR=Math.max(maxR,p.rms);lvl.set(p.rms);
+    if(voiced(p)){nV++;last=p;}
+    if(performance.now()-t0>=4000){
+      stopListening();lvl.set(0);
+      var db=Math.round(20*Math.log10(Math.max(maxR,1e-5)));
+      if(nV>=8&&last){
+        var midi=Math.round(69+12*Math.log2(last.freq/440));
+        out.className='ok';out.textContent='Working. Peak level about '+db+' dB, and I could follow your pitch (last note heard: '+midiName(midi)+', about '+Math.round(last.freq)+' Hz).';
+      }else{out.className='warn';out.textContent='Peak level about '+db+' dB. '+micHint(maxR);}
+      stopMic();
+    }
+  });
+}
 function micError(e){
   var n=e&&e.name;
   if(n==='NotAllowedError'||n==='SecurityError')return 'Microphone is blocked. Allow it for this site in your browser settings, then try again.';
   if(n==='NotFoundError')return 'No microphone found.';
   return (e&&e.message)||'Couldn’t start the microphone.';
 }
-function voiced(p){return p&&p.freq&&p.clarity>=0.85&&p.rms>=0.01;}
+function voiced(p){return !!(p&&p.freq&&p.clarity>=0.8&&p.rms>=(p.gate||0.01));}
 
 /* ---------- shared widgets ---------- */
 function Meter(tol){
@@ -586,6 +670,14 @@ function Meter(tol){
     needle.className='needle';
     needle.style.left=(50+Math.max(-range,Math.min(range,err))/range*50)+'%';
   }};
+}
+function LevelBar(){
+  var fill=h('i');
+  var el=h('div',null,h('div',{class:'bar',role:'img','aria-label':'Microphone level',style:'height:12px'},fill),
+    h('div',{class:'scale'},h('span',null,'mic level: quiet'),h('span',null,'loud')));
+  return {el:el,set:function(rms){
+    var db=20*Math.log10(Math.max(rms,1e-5));
+    fill.style.width=Math.max(0,Math.min(100,(db+60)/50*100))+'%';}};
 }
 function FeedbackToggle(){
   var f=S.settings.feedback;
@@ -626,7 +718,7 @@ function updateChrome(){
     if(c.dataset.tab===S.tab)c.setAttribute('aria-current','page');else c.removeAttribute('aria-current');});
 }
 function setTab(t){
-  stopListening();stopLesson();
+  stopListening();stopLesson();stopReplay();
   if(t!=='sing'&&t!=='phrase')stopMic();
   S.tab=t;
   if(S.sing.phase==='rec')S.sing.phase='idle';
@@ -700,16 +792,18 @@ function renderSing(){
   if(G.phase==='idle'||G.phase==='result'){
     card.append(h('div',{class:'row'},hear,h('button',{class:'btn primary',type:'button',onclick:singStart},G.phase==='result'?'Sing again':'Sing it (4 s)')));
     if(G.msg)card.append(h('p',{class:'warn',role:'alert'},G.msg));
+    var rr2=ReplayRow('sing');if(rr2)card.append(rr2);
   }
   if(G.phase==='rec'){
-    var m=Meter(tol);S.refs.meter=m;S.refs.bar=h('i');
-    card.append(h('p',{class:'big'},'Sing now…'),
+    var m=Meter(tol);S.refs.meter=m;S.refs.bar=h('i');S.refs.lvl=LevelBar();
+    card.append(h('p',{class:'big'},'Sing now…'),S.refs.lvl.el,
       S.settings.feedback==='live'?m.el:h('p',{class:'muted'},'Hold the note steadily. The result appears after 4 seconds.'),
       h('div',{class:'bar'},S.refs.bar),
       h('button',{class:'btn',type:'button',onclick:singFinish},'Done'));
   }
   if(G.phase==='guess'){
-    card.append(h('h2',null,'How did that sound?'),h('p',{class:'muted'},'Decide before you see the result.'),
+    var rr1=ReplayRow('sing');
+    card.append(h('h2',null,'How did that sound?'),h('p',{class:'muted'},'Decide before you see the result. You can listen back first.'),rr1||'',
       h('div',{class:'row'},['flat','right','sharp'].map(function(g){
         return h('button',{class:'btn',type:'button',onclick:function(){singGuess(g);}},g==='right'?'About right':g==='flat'?'Flat (too low)':'Sharp (too high)');})));
   }
@@ -729,11 +823,13 @@ function renderSing(){
 async function singStart(){
   var G=S.sing;G.msg='';stopLesson();
   try{await startMic();}catch(e){G.msg=micError(e);render();return;}
-  G.phase='rec';G.frames=[];G.guess=null;G.result=null;G.t0=performance.now();
+  G.phase='rec';G.frames=[];G.guess=null;G.result=null;G.t0=performance.now();G.maxRms=0;
+  startRec('sing');
   render();
   var tgt=tFreq(G.sym,G.oct),tol=S.settings.tol;
   startListening(function(p){
     var el=performance.now()-G.t0,v=voiced(p);
+    G.maxRms=Math.max(G.maxRms||0,p.rms);if(S.refs.lvl)S.refs.lvl.set(p.rms);
     G.frames.push({t:el,err:v?foldCents(cents(p.freq,tgt)):null});
     if(S.refs.meter&&S.settings.feedback==='live')S.refs.meter.set(v?foldCents(cents(p.freq,tgt)):null);
     if(S.refs.bar)S.refs.bar.style.width=Math.min(100,el/4000*100)+'%';
@@ -742,10 +838,10 @@ async function singStart(){
 }
 function singFinish(){
   var G=S.sing;if(G.phase!=='rec')return;
-  stopListening();
+  stopListening();stopRec();
   var good=G.frames.filter(function(f){return f.err!=null&&f.t>=400;}).map(function(f){return f.err;});
   if(good.length<8)good=G.frames.filter(function(f){return f.err!=null;}).map(function(f){return f.err;});
-  if(good.length<8){G.phase='idle';G.msg='I couldn’t hear a clear note. Move closer to the mic, sing a bit louder and hold the note steadily.';render();return;}
+  if(good.length<8){G.phase='idle';G.msg=micHint(G.maxRms);render();return;}
   G.result={err:median(good),spread:quantile(good,0.75)-quantile(good,0.25)};
   if(S.settings.feedback==='predict'){G.phase='guess';render();}
   else{G.guess=null;commitSing();G.phase='result';render();}
@@ -821,16 +917,17 @@ function renderPhrase(){
   if(useVoice)S.refs.lessonBtns[half]=hear;
   if(P.phase==='idle'||P.phase==='result'){
     ctl.append(h('div',{class:'row'},hear,h('button',{class:'btn primary',type:'button',disabled:!notes.length,onclick:phraseStart},P.phase==='result'?'Sing again':'Start singing')));
+    var rr3=ReplayRow('phrase');if(rr3)ctl.append(rr3);
   }else if(P.phase==='listening'){
-    var m=Meter(tol);S.refs.meter=m;
-    ctl.append(h('p',{class:'big'},'Sing: '+(notes[P.idx]?swaraLabel(notes[P.idx].sym,notes[P.idx].oct):'')),
+    var m=Meter(tol);S.refs.meter=m;S.refs.lvl=LevelBar();
+    ctl.append(h('p',{class:'big'},'Sing: '+(notes[P.idx]?swaraLabel(notes[P.idx].sym,notes[P.idx].oct):'')),S.refs.lvl.el,
       S.settings.feedback==='live'?m.el:h('p',{class:'muted'},'Sing and hold the note. Results appear at the end.'),
       h('div',{class:'row'},hear,
         h('button',{class:'btn',type:'button',onclick:function(){phraseRecord(null,true);}},'Skip note'),
-        h('button',{class:'btn',type:'button',onclick:function(){stopListening();P.phase='idle';render();}},'Stop')));
+        h('button',{class:'btn',type:'button',onclick:function(){stopListening();stopRec();P.phase='idle';render();}},'Stop')));
   }else if(P.phase==='guess'){
     ctl.append(h('h2',null,'Which note do you think was furthest off?'),
-      h('p',{class:'muted'},'Decide before you see the results.'),
+      h('p',{class:'muted'},'Decide before you see the results. You can listen back first.'),ReplayRow('phrase')||'',
       h('div',{class:'chips'},P.results.map(function(r,i){
         return h('button',{class:'chip',type:'button',onclick:function(){phraseGuess(i);}},swaraLabel(r.sym,r.oct));})));
   }
@@ -853,7 +950,7 @@ async function phraseStart(){
   var P=S.phrase;stopLesson();
   try{P.notes=parsePhrase(phraseText());}catch(e){P.msg=e.message;render();return;}
   try{await startMic();}catch(e){P.msg=micError(e);render();return;}
-  resetPhrase();P.phase='listening';render();
+  resetPhrase();P.phase='listening';startRec('phrase');render();
   startListening(phraseFrame);
 }
 function curTargetCents(){
@@ -863,6 +960,7 @@ function curTargetCents(){
 function phraseFrame(p){
   var P=S.phrase;if(P.phase!=='listening')return;
   var v=voiced(p),abs=v?cents(p.freq,saFreq()):null;
+  if(S.refs.lvl)S.refs.lvl.set(p.rms);
   if(S.refs.meter&&S.settings.feedback==='live')S.refs.meter.set(v?foldCents(abs-curTargetCents()):null);
   if(P.wait){
     var rr=p.rms||0;
@@ -892,7 +990,7 @@ function phraseRecord(medAbs,skipped){
   render();
 }
 function phraseFinish(){
-  var P=S.phrase;stopListening();
+  var P=S.phrase;stopListening();stopRec();
   var worst=0,i;for(i=1;i<P.results.length;i++)if(!P.results[i].skipped&&Math.abs(P.results[i].err)>Math.abs(P.results[worst].err))worst=i;
   P.worst=worst;
   if(S.settings.feedback==='predict'){P.phase='guess';}
@@ -988,6 +1086,14 @@ function renderData(){
     h('label',{for:'tun'},'Swara tuning'),tuneSel,
     h('label',{for:'tol'},'What counts as “on target”'),tolSel,
     h('label',{for:'vol'},'Drone volume'),vol));
+  var mtOut=h('p',{role:'status','aria-live':'polite',style:'margin:10px 0 0'},'');
+  var mtLvl=LevelBar();
+  var agcBtn=h('button',{type:'button','aria-pressed':String(!!st.agc),class:'btn',onclick:function(){
+    st.agc=!st.agc;save();stopMic();render();}},'Boost quiet microphones (auto gain): '+(st.agc?'on':'off'));
+  $app.append(h('div',{class:'card'},h('h2',null,'Microphone test'),
+    h('p',{class:'muted',style:'margin:0 0 8px'},'Tap the button, then sing or hum a steady note for 4 seconds. The bar shows how loud the app hears you, and the line below shows what it detects.'),
+    h('div',{class:'row'},h('button',{class:'btn primary',type:'button',onclick:function(){micTest(mtOut,mtLvl);}},'Test microphone'),agcBtn),
+    mtLvl.el,mtOut));
   var out=h('textarea',{readonly:true,'aria-label':'Export data',id:'exp'});out.value=buildExport(S.entries,S.settings);
   var msg=h('p',{class:'muted',role:'status','aria-live':'polite'},'');
   var inp=h('textarea',{'aria-label':'Paste data to import',id:'imp',placeholder:'Paste exported data here'});
